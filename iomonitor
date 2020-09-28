@@ -1,0 +1,477 @@
+#!/usr/bin/perl
+# Executes a command, attaches to a process or reads a strace log
+# to generate a CSV file of the IO requests performed.
+#
+use warnings;
+use strict;
+use Getopt::Long qw/:config require_order/;
+use Data::Dumper;
+
+my $usage = <<END_OF_HELP;
+Usage:
+   $0 [options] command [command-options...]
+   $0 [options] -p pid
+   $0 [options] -i strace.log
+
+Options:
+    -o | --output output-file     Write the csv to an output file
+    -i | --input input-file       Read strace log file
+    -p | --pid pid                Attach to existing process
+    -v | --verbose                Print all system calls
+
+strace log files should be produced with -f -T -tt -v to ensure
+that all the important values are recorded.
+
+END_OF_HELP
+
+my $verbose;
+my $output_file;
+my $input_file;
+my $strace_pid;
+
+GetOptions(
+	"v|verbose+"		=> \$verbose,
+	"p|pid=i"		=> \$strace_pid,
+	"o|output=s"		=> \$output_file,
+	"i|input=s"		=> \$input_file,
+	"h|?|help"		=> sub { print $usage; exit 0; },
+) or die $usage;
+
+
+# Make sure they didn't pass in any additional arguments to -p or -i
+if (defined $strace_pid or defined $input_file)
+{
+	die "Excess arguments?\n" if @ARGV;
+}
+
+my $output;
+if (defined $output_file)
+{
+	open $output, ">$output_file"
+		or die "$output_file: Unable to open for writing: $!\n";
+} else {
+	$output = \*STDERR;
+}
+
+# map per-pid, per-fd of the file info
+my %fds;
+
+sub unhex
+{
+	local $_ = shift;
+
+	# replace \xXX with the actual characters
+	s/\\x([0-9a-f][0-9a-f])/chr(hex $1)/ge;
+	return $_;
+}
+
+
+# extract the Nth argument from an strace argument list
+# since all strings are in hex, this avoids any parsing problems.
+sub arg
+{
+	my $arg = shift;
+	my $n = shift;
+	my @args = split /,\s+/, $arg;
+	my $s = $args[$n];
+
+	if ($s =~ /^"/)
+	{
+		return unhex $s;
+	}
+
+	return $s;
+}
+
+
+# Parse a socket descriptor into host:port
+sub parse_ip
+{
+	my $fd = shift;
+	local $_ = shift;
+
+	# should warn if we don't understand
+	my ($family) = /sa_family=([A-Z0-9_]+)/
+		or return {type=>"socket", name=>"fd=$fd"};
+
+	if ($family eq "AF_INET")
+	{
+		my ($host) = /inet_addr\("(.*?)"\)/;
+		my ($port) = /sin_port=htons\((\d+)\)/;
+
+		unless(defined $host)
+		{
+			warn "Unable to parse AF_INET: $_\n";
+			return {type=>"socket", name=>"AF_INET:fd=$fd"};
+		}
+
+		return {type=>"socket", name=>"$host", port=>"$port"};
+	}
+
+	if ($family eq "AF_FILE")
+	{
+		my ($file) = /path="([\\x0-9a-f]*)"/;
+		return {type=>"socket", name=>unhex($file)};
+	}
+
+	if ($family eq "AF_INET6")
+	{
+		my ($host) = /inet_pton\(AF_INET6, "(.*?)"/;
+		my ($port) = /sin6_port=htons\((\d+)\)/;
+		return {type=>"socket", name=>"$host", port=>"$port"};
+	}
+
+	return {type=>"socket", name=>"$family:fd=$fd"};
+}
+
+
+sub file_name
+{
+	my ($pid,$fd) = @_;
+	my $file = $fds{$pid}{$fd};
+	return $file if defined $file;
+
+	return {type=>"stdio", name=>"stdin"} if $fd == 0;
+	return {type=>"stdio", name=>"stdout"} if $fd == 1;
+	return {type=>"stdio", name=>"stderr"} if $fd == 2;
+
+	return {type=>"unknown", name=>"fd=$fd"};
+}
+
+sub output_row
+{
+	my ($c,$fd,$direction,$count,$file) = @_;
+	my $fname = $file->{name};
+	my $port = $file->{port} || "";
+	print $output "$c->{time},$c->{dt},$c->{pid},$fd,$direction,$count,$fname,$port\n";
+}
+
+sub trace_open
+{
+	my $c = shift;
+
+	# ignore failed attempts to open files
+	return if $c->{rc} < 0;
+
+	$fds{$c->{pid}}{$c->{rc}} = {type=>"file", name=>arg($c->{args}, 0)};
+}
+
+sub trace_openat
+{
+	my $c = shift;
+
+	# ignore failed attempts to open files
+	return if $c->{rc} < 0;
+
+	# should try to parse the CWD as well as the file name
+	$fds{$c->{pid}}{$c->{rc}} = {type=>"file", name=>arg($c->{args}, 1)};
+}
+
+sub trace_fcntl
+{
+	my $c = shift;
+
+	# we only want to see F_DUPFD calls
+	return unless arg($c->{args}, 1) eq 'F_DUPFD';
+
+	my $fd = arg($c->{args}, 0);
+	my $new_fd = $c->{rc};
+	my $pid = $c->{pid};
+
+	# ignore failed attempts to manipulate files
+	return if $new_fd < 0;
+
+	$fds{$pid}{$new_fd} = $fds{$pid}{$fd};
+}
+
+
+sub trace_dup2
+{
+	my $c = shift;
+	return if $c->{rc} < 0;
+	my $old_fd = arg($c->{args}, 0);
+	my $new_fd = arg($c->{args}, 1);
+	my $pid = $c->{pid};
+
+	$fds{$pid}{$new_fd} = $fds{$pid}{$old_fd};
+#print "--- $pid $old_fd -> $new_fd: $fds{$pid}{$old_fd} $fds{$pid}{$new_fd}\n";
+#print Dumper(\%fds);
+}
+
+
+sub trace_pipe
+{
+	my $c = shift;
+
+	# ignore failed attempts to open files
+	return if $c->{rc} < 0;
+	my $pid = $c->{pid};
+
+	my ($fd1,$fd2) = $c->{args} =~ /\[(\d+), (\d+)\]/;
+
+	$fds{$pid}{$fd1} = {type=>"pipe", name=>"pipe<-$fd2"};
+	$fds{$pid}{$fd2} = {type=>"pipe", name=>"pipe->$fd1"};
+}
+
+sub trace_close
+{
+	my $c = shift;
+	my $fd = arg($c->{args}, 0);
+	my $pid = $c->{pid};
+
+	delete $fds{$c->{pid}}{$fd};
+}
+
+
+sub trace_clone
+{
+	my $c = shift;
+	my $new_pid = $c->{rc};
+	my $pid = $c->{pid};
+
+	return if $new_pid < 0;
+
+	if ($c->{args} =~ /CLONE_FILES/)
+	{
+		# files and fd table are shared
+		$fds{$new_pid} = $fds{$pid};
+	} else {
+		# copy the files table since it is not shared
+		$fds{new_pid} = { %{$fds{$pid}} };
+	}
+}
+
+
+sub trace_socket
+{
+	my $c = shift;
+
+	# ignore failed attempts to create sockets
+	return if $c->{rc} < 0;
+
+	my $type = arg($c->{args}, 1);
+	if ($type =~ /SOCK_DGRAM/)
+	{
+		$type = "udp:";
+	}
+	elsif ($type =~ /SOCK_STREAM/)
+	{
+		$type = "tcp:";
+	} else {
+		$type = "$type:";
+	}
+
+	$fds{$c->{pid}}{$c->{rc}} = {type=>"socket", name=>"$type"};
+}
+
+
+sub trace_connect
+{
+	my $c = shift;
+
+	# we should ignore failed attempts to connect, but
+	# it might mean something if this is a non-blocking attempt
+	#return if $c->{rc} < 0;
+
+	my $fd = arg($c->{args}, 0);
+
+	my $file = parse_ip($fd, $c->{args});
+
+	$fds{$c->{pid}}{$fd} = $file
+}
+
+
+sub trace_accept
+{
+	my $c = shift;
+
+	# ignore failed attempts to create sockets
+	my $fd = $c->{rc};
+	return if $fd < 0;
+
+	# accept only works on TCP, right?
+	$fds{$c->{pid}}{$fd} = parse_ip($fd, $c->{args});
+}
+
+sub trace_read
+{
+	my $c = shift;
+	my $fd = arg($c->{args}, 0);
+	my $pid = $c->{pid};
+	my $file = file_name($pid, $fd);
+
+	output_row($c,$fd,"R",$c->{rc},$file)
+}
+
+sub trace_recvmsg
+{
+	my $c = shift;
+	my $fd = arg($c->{args}, 0);
+	my $file = parse_ip($fd, $c->{args});
+
+	output_row($c,$fd,"R",$c->{rc},$file)
+}
+
+sub trace_sendmsg
+{
+	my $c = shift;
+	my $fd = arg($c->{args}, 0);
+	my $file = parse_ip($fd, $c->{args});
+
+	output_row($c,$fd,"W",$c->{rc},$file)
+}
+
+
+sub trace_write
+{
+	my $c = shift;
+	my $fd = arg($c->{args}, 0);
+	my $pid = $c->{pid};
+	my $file = file_name($pid, $fd);
+
+	output_row($c,$fd,"W",$c->{rc},$file)
+}
+
+
+my %tracers = (
+	open	=> \&trace_open,
+	openat	=> \&trace_openat,
+	pipe	=> \&trace_pipe,
+	read	=> \&trace_read,
+	recvfrom => \&trace_read,
+	write	=> \&trace_write,
+	sendto	=> \&trace_write,
+	socket  => \&trace_socket,
+	connect	=> \&trace_connect,
+	accept	=> \&trace_accept,
+	recvmsg	=> \&trace_recvmsg,
+	clone	=> \&trace_clone,
+	fcntl	=> \&trace_fcntl,
+	dup2	=> \&trace_dup2,
+	close	=> \&trace_close,
+);
+
+my $strace;
+my $child;
+
+if (defined $input_file)
+{
+	die "-p does not make sense with -i?\n"
+		if defined $strace_pid;
+	
+	open $strace, "<", $input_file
+		or die "$input_file: Unable to read: $!\n";
+
+	# if they haven't specified an output file, switch this mode
+	# to write to stdout instead of stderr.
+	$output = \*STDOUT unless defined $output_file;
+} else {
+	my $strace_pipe = "/tmp/strace.$$";
+	system("mknod", $strace_pipe, "p");
+
+	$child = fork();
+	die "fork failed: $!\n" unless defined $child;
+
+	if ($child == 0)
+	{
+		my @filter = ();
+
+		unless ($verbose)
+		{
+			# build a list of syscalls to track
+			push @filter, '-e', join(',', keys %tracers);
+		}
+
+		exec("strace",
+			"-f",		# follow forks
+			"-tt",		# microsecond timestamps
+			"-T",		# timestamp deltas
+			"-q",		# don't output attach/detach messages
+			"-xx",		# output all strings in hex
+			@filter,	# if we're filtering anything
+			"-o", $strace_pipe, # write to our pipe
+			$strace_pid ? ("-p", $strace_pid) : ("--", @ARGV)
+		);
+		die;
+	}
+
+	open($strace, "<$strace_pipe")
+		or die "$strace_pipe: unable to open: $!\n";
+}
+
+print $output "time,dt,pid,fd,dir,bytes,file,port\n";
+
+# hash map of the <unfinished...> lines from each pid
+my %lines;
+
+while (<$strace>)
+{
+	chomp;
+
+	# ignore a few hard coded ones that we know will fail to parse
+	next if / = \?/;
+	next if /--- SIG/;
+	next if / exited /;
+
+	if(/unfinished/)
+	{
+		my ($pid) = /^([0-9]+)/;
+
+		# push this line onto the state for this pid.
+		my ($cmd) = /^(.*) <unfinished.*/;
+
+		#warn "$pid: unfinished '$cmd'\n";
+		$lines{$pid} = $cmd;
+		next;
+	}
+
+	if (/resumed/)
+	{
+		my ($pid) = /^([0-9]+)/;
+		my ($rest) = / resumed> (.*)/;
+
+		#warn "resuming $pid: $lines{$pid}$rest\n";
+		$_ = $lines{$pid} . $rest;
+	}
+
+	my ($pid,$time,$syscall,$args,$rc,$errno,$dt) = /
+		^
+		([0-9]+)		# pid
+		\s+
+		([0-9:.]+)		# timestamp
+		\s+
+		([^(]+)			# syscall
+		\((.*)\)		# arguments, without ()
+		\s+=\s+
+		([-?0-9a-fx]+)		# rc
+		\s+
+		(?:(.*)\s+)?		# optional ERRNO
+		<([0-9.]+)>		# relative timestamp
+		$
+	/x
+		or warn "$_: unable to parse\n"
+		and next;
+
+	print $output " $pid,$rc,$syscall,$args\n" if $verbose;
+
+	next unless exists $tracers{$syscall};
+
+	$tracers{$syscall}->({
+		pid		=> $pid,
+		time		=> $time,
+		syscall		=> $syscall,
+		args		=> $args,
+		rc		=> $rc,
+		errno		=> $errno,
+		dt		=> $dt,
+	});
+}
+
+# use the same exit code as strace (which uses the same exit code as its child)
+if (defined $child)
+{
+    waitpid($child, 0);
+    exit $?>>8;
+}
+
+__END__
